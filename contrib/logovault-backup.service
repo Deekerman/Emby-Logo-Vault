@@ -1,0 +1,20 @@
+# /etc/systemd/system/logovault-backup.service
+#
+# Optional. Pairs with logovault-backup.timer. Read the caution in the README
+# first: an unattended backup run after a bad source has clobbered your logos
+# bakes the bad artwork in as the new backup. The manifest snapshots are your
+# way back, but you have to go looking.
+
+[Unit]
+Description=Back up Emby channel logos to the vault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=logovault
+EnvironmentFile=/etc/logovault.env
+ExecStart=/usr/bin/python3 /opt/logovault/emby_logo_vault.py \
+  --vault /opt/logovault/vault backup
+NoNewPrivileges=true
+ProtectSystem=full

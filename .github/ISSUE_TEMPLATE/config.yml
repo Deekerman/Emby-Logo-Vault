@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions about setup
+    url: https://github.com/Deekerman/Emby-Logo-Vault/discussions
+    about: Ask here before opening a bug if you are not sure it is one.

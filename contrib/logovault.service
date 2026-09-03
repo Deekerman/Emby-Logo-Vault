@@ -1,0 +1,23 @@
+# /etc/systemd/system/logovault.service
+#
+# Expects the script at /opt/logovault/emby_logo_vault.py, a writable vault at
+# /opt/logovault/vault, and /etc/logovault.env holding EMBY_URL and
+# EMBY_API_KEY at mode 600.
+
+[Unit]
+Description=Emby channel logo vault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=logovault
+EnvironmentFile=/etc/logovault.env
+ExecStart=/usr/bin/python3 /opt/logovault/emby_logo_vault.py \
+  --vault /opt/logovault/vault serve --host 0.0.0.0 --port 8077
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

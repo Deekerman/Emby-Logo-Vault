@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest something the vault should do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The situation first, rather than the solution.
+      placeholder: |
+        My provider ships one logo per channel and I want the dark slots filled
+        from a different source than Primary.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Keeping the project's constraints
+      options:
+        - label: This can be done with the Python standard library alone
+        - label: This stays a single file

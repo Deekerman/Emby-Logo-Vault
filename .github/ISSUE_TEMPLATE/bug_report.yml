@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in the vault, the interface or the CLI does not behave
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste your Emby API key. It appears in the URL of every request,
+        so redact it out of any log or error message you copy in here.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+      placeholder: |
+        Pressed Back up everything. The footer said 0 images saved.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start with `./emby_logo_vault.py`
+        2. Press Deep scan
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: emby
+    attributes:
+      label: Emby server version
+      placeholder: "4.8.11.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`.
+      placeholder: "3.11.2"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Where it runs
+      placeholder: "Debian 12, in a container, alongside Dispatcharr"
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where you hit it
+      options:
+        - Web interface
+        - Command line
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `./emby_logo_vault.py status`
+      description: Changes nothing. Redact the API key if one appears.
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors or tracebacks
+      description: Browser console errors count too, if the interface misbehaved.
+      render: text

@@ -1,0 +1,25 @@
+# Vault data. Never commit channel artwork or the manifest.
+emby_logo_vault/
+vault/
+manifest.json
+manifest.*.json
+exclusions.json
+
+# Secrets
+*.env
+!contrib/*.env.example
+.envrc
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

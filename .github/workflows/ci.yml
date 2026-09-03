@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          # The README promises 3.8, which needs an older runner image.
+          - os: ubuntu-22.04
+            python-version: "3.8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: No third party imports
+        # The whole point of the script is that it installs nothing, so fail
+        # loudly if an import sneaks in that a bare interpreter cannot satisfy.
+        run: python -X importtime -c "import emby_logo_vault" > /dev/null
+
+      - name: Byte compile
+        run: python -m compileall -q emby_logo_vault.py tests
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: CLI help
+        run: |
+          python emby_logo_vault.py --help
+          for c in serve backup fill status restore groups exclude include; do
+            python emby_logo_vault.py "$c" --help > /dev/null
+          done
+
+      - name: Missing credentials fail cleanly
+        run: |
+          set +e
+          out=$(env -u EMBY_URL -u EMBY_API_KEY python emby_logo_vault.py status 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test $code -ne 0
+          echo "$out" | grep -q "EMBY_URL"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install ruff==0.14.0
+
+      - run: ruff check --output-format=github .
+
+  serve:
+    name: Web interface starts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Serve the page and fetch it
+        # No Emby here, so the page has to render on its own and the API call
+        # behind it has to fail as a clean 502 rather than a traceback.
+        env:
+          EMBY_URL: http://127.0.0.1:9    # discard port, nothing listening
+          EMBY_API_KEY: ci
+        run: |
+          python emby_logo_vault.py --vault "$RUNNER_TEMP/vault" \
+            serve --host 127.0.0.1 --port 8077 &
+          pid=$!
+          for _ in $(seq 30); do
+            curl -fsS http://127.0.0.1:8077/ -o page.html && break
+            sleep 1
+          done
+          grep -q "Channel logo vault" page.html
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8077/api/state)
+          echo "api/state returned $code"
+          test "$code" = "502"
+          kill $pid

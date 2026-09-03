@@ -1,0 +1,15 @@
+# The script has to keep running on Python 3.8 with the standard library only,
+# so pin the target version and let ruff flag anything newer.
+target-version = "py38"
+line-length = 100
+
+[lint]
+# Defaults (E4, E7, E9, F) plus warnings and bugbear.
+extend-select = ["W", "B"]
+ignore = [
+    "E501",   # long lines are unavoidable inside the embedded HTML page
+    "B904",   # the CLI deliberately re-raises RuntimeError as a bare SystemExit
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["E402"]  # sys.path has to be set before the import under test

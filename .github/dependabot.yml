@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # The script itself has no dependencies. This only keeps the CI actions
+  # current so the workflow does not rot on deprecated runner images.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci

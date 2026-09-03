@@ -1,0 +1,13 @@
+# /etc/systemd/system/logovault-backup.timer
+#
+#   sudo systemctl enable --now logovault-backup.timer
+
+[Unit]
+Description=Weekly Emby channel logo backup
+
+[Timer]
+OnCalendar=Sun 04:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
