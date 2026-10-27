@@ -1,8 +1,8 @@
 # Emby channel logo vault
 
-Back up, preview and restore Emby live TV channel logos across all three Emby
-channel image slots. Built for IPTV setups where a provider or EPG refresh can
-silently replace your channel artwork.
+Back up, preview and restore live TV channel logos across all three Emby
+channel image slots, and across Dispatcharr. Built for IPTV setups where a
+provider or EPG refresh can silently replace your channel artwork.
 
 Single Python file, standard library only, no pip install. Python 3.8 or newer.
 
@@ -11,6 +11,10 @@ Single Python file, standard library only, no pip install. Python 3.8 or newer.
 Emby has no export for channel logos. If an M3U or EPG source overwrites them,
 they are gone. This keeps a local copy, tells you what changed, and pushes the
 good version back.
+
+One vault holds every logo you like. From there you push to Emby, or to
+Dispatcharr, or to both. The two are separate actions: nothing reaches either
+server as a side effect of the other.
 
 ## Emby's three logo slots
 
@@ -24,6 +28,9 @@ Primary is dark art for light backgrounds and the LogoLight pair is light art
 for dark backgrounds. That inversion is why the interface has a background
 switcher: you cannot judge a logo without seeing it on the background it will
 actually appear on.
+
+Dispatcharr holds one logo per channel, not three, so it appears as a single
+fourth column. It is optional: leave it unconfigured and nothing changes.
 
 ## Install
 
@@ -52,6 +59,22 @@ Open `http://your-host:8077`.
 First run: press **Deep scan**, confirm the logo columns populate, then
 **Back up everything**.
 
+### Dispatcharr, optional
+
+Add these and a Dispatcharr column appears next to the Emby ones:
+
+```bash
+export DISPATCHARR_URL="http://192.168.1.10:9191"
+export DISPATCHARR_API_KEY="your_key_here"
+```
+
+The key comes from Dispatcharr's API keys, or use
+`DISPATCHARR_USER` and `DISPATCHARR_PASS` instead and it logs in for a token.
+Pushing needs an admin level account, since uploading a logo does.
+
+If Dispatcharr is unreachable the Emby side still works; the page says so in
+the footer rather than failing to load.
+
 ## Web interface
 
 **Preview background** switches every tile between white, near black and a
@@ -61,11 +84,14 @@ instead of a real alpha channel.
 **Filters** narrow to All, Changed, Not saved, Edited or Excluded, plus a
 channel name search. Every bulk action respects the current filter.
 
-**Selection** bar offers Every cell, All primary, All logo light, All logo light
-color, and Clear. Each is a toggle. There is a per channel checkbox too. Empty
-slots are never selected. The footer buttons show how many of your selection
-each action can actually act on, since pushing needs vault artwork and saving
-needs Emby artwork.
+**Selection** bar offers Every cell, one button per slot, and Clear. Each is a
+toggle. There is a per channel checkbox too. Empty slots are never selected.
+The footer buttons show how many of your selection each action can actually act
+on, since pushing needs vault artwork and saving needs artwork on the server.
+
+**Push to Emby** and **Push to Dispatcharr** are separate buttons. Each takes
+only the cells belonging to its own destination, so selecting everything and
+pressing one of them cannot touch the other server.
 
 **Per cell actions** appear on hover:
 
@@ -89,17 +115,27 @@ a regular expression.
 ./emby_logo_vault.py backup             # save every logo to the vault
 ./emby_logo_vault.py status             # drift report, changes nothing
 ./emby_logo_vault.py restore --preview  # what a push would change
-./emby_logo_vault.py restore            # push the vault back
+./emby_logo_vault.py restore            # push the vault back to Emby
 ./emby_logo_vault.py restore --force    # push everything regardless
+
+./emby_logo_vault.py restore --target dispatcharr   # push to Dispatcharr only
+./emby_logo_vault.py restore --target both          # push to each in turn
 
 ./emby_logo_vault.py fill                              # copy Primary into empty slots
 ./emby_logo_vault.py fill --source LogoLightColor      # copy a different slot
+./emby_logo_vault.py fill --source Dispatcharr         # seed Emby from Dispatcharr
 ./emby_logo_vault.py fill --overwrite                  # replace filled slots too
 
 ./emby_logo_vault.py groups             # list groups and exclusions
 ./emby_logo_vault.py exclude "PPV" "VOD"
 ./emby_logo_vault.py include "Sports"
 ```
+
+`restore` defaults to `--target emby`, so existing scripts and timers keep
+pushing only to Emby.
+
+`backup` saves from both servers when Dispatcharr is configured. `status`
+prints a column per slot.
 
 `serve` is the default when no subcommand is given. It takes `--host`, `--port`
 and `--open`.
@@ -116,6 +152,26 @@ is caught, rather than only missing artwork being noticed.
 **Deep scan** exists because some Emby builds omit LogoLight tags from the
 channel list response. It queries each image endpoint directly. Slower, so it is
 a button rather than the default, but the CLI `backup` always deep probes.
+
+For Dispatcharr the equivalent of an image tag is the logo's URL, which is
+unique per logo row, so drift is spotted without downloading anything.
+
+## Why pushing to Dispatcharr sticks
+
+Dispatcharr keeps provider metadata in a channel's own fields and your edits in
+a separate override record. An M3U sync rewrites the fields and leaves the
+override alone. So for a channel Dispatcharr created from your M3U, this writes
+the logo as an override, and a refresh cannot undo it. Channels you made by
+hand have no override and sync never touches them, so there it writes the field
+directly.
+
+Dispatcharr's M3U then publishes whichever logo wins, which is how Emby ends up
+with your artwork on its next guide refresh. That makes pushing to Dispatcharr
+the durable fix and pushing to Emby the immediate one. Doing both is reasonable:
+one takes effect now, the other survives the next refresh.
+
+Dispatcharr accepts PNG, JPEG, GIF, WebP and SVG up to 5 MB. Bitmaps are
+refused before anything is uploaded.
 
 ## Vault layout
 
@@ -156,7 +212,7 @@ you would have to go looking. For a frozen known good state, run backups by hand
 
 ## Cautions
 
-There is no authentication on the interface and the API key sits in the
+There is no authentication on the interface and the API keys sit in the
 environment, so keep the port on your LAN.
 
 The vault directory holds the only copy of your logos. Put it somewhere your

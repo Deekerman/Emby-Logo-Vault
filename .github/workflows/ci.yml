@@ -71,7 +71,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install ruff==0.14.0
+      - run: pip install ruff==0.16.9
 
       - run: ruff check --output-format=github .
 
@@ -104,3 +104,33 @@ jobs:
           echo "api/state returned $code"
           test "$code" = "502"
           kill $pid
+
+      - name: Dispatcharr settings are refused when incomplete
+        # A URL with no credentials is a misconfiguration worth catching at
+        # startup rather than on the first push.
+        env:
+          EMBY_URL: http://127.0.0.1:9
+          EMBY_API_KEY: ci
+          DISPATCHARR_URL: http://127.0.0.1:9
+        run: |
+          set +e
+          out=$(python emby_logo_vault.py --vault "$RUNNER_TEMP/v2" status 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test $code -ne 0
+          echo "$out" | grep -q "DISPATCHARR_API_KEY"
+
+      - name: Pushing to Dispatcharr without it configured is refused
+        env:
+          EMBY_URL: http://127.0.0.1:9
+          EMBY_API_KEY: ci
+        run: |
+          set +e
+          out=$(python emby_logo_vault.py --vault "$RUNNER_TEMP/v3" \
+                  restore --target dispatcharr 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test $code -ne 0
+          echo "$out" | grep -q "not configured"

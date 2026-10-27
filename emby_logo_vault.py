@@ -41,16 +41,33 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IMAGE_TYPES = ["Primary", "LogoLight", "LogoLightColor"]
 
+# Dispatcharr holds a single logo per channel, and it sits upstream of Emby:
+# its M3U is what Emby imports. Treating it as a fourth vault slot means the
+# grid, the library picker, copy between slots and the exclusion rules all
+# work on it without special cases.
+DISPATCHARR = "Dispatcharr"
+VAULT_SLOTS = IMAGE_TYPES + [DISPATCHARR]
+
 TYPE_LABEL = {
     "Primary": "Primary",
     "LogoLight": "Logo light",
     "LogoLightColor": "Logo light color",
+    DISPATCHARR: "Dispatcharr",
 }
 
 TYPE_NOTE = {
     "Primary": "shown on light backgrounds",
     "LogoLight": "dark backgrounds, plain",
     "LogoLightColor": "dark backgrounds, default",
+    DISPATCHARR: "upstream, feeds Emby on refresh",
+}
+
+# For the status table, where the full labels do not fit side by side.
+TYPE_SHORT = {
+    "Primary": "Primary",
+    "LogoLight": "Light",
+    "LogoLightColor": "Light color",
+    DISPATCHARR: "Dispatcharr",
 }
 
 MIME_EXT = {
@@ -63,10 +80,20 @@ MIME_EXT = {
 }
 EXT_MIME = {v: k for k, v in MIME_EXT.items()}
 
+# What Dispatcharr's own upload validator accepts, which is everything Emby
+# takes except bitmaps, at 5MB.
+DIS_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}
+DIS_MAX_BYTES = 5 * 1024 * 1024
+
 MANIFEST_NAME = "manifest.json"
 IMAGE_DIR = "images"
 
-STATE = {"base": None, "key": None, "vault": None}
+STATE = {
+    "base": None, "key": None, "vault": None,
+    # Dispatcharr, all optional. Either an API key or a username and password.
+    "dis_base": None, "dis_key": None, "dis_user": None, "dis_pass": None,
+    "dis_token": None,
+}
 LOCK = threading.Lock()
 
 
@@ -138,6 +165,172 @@ def upload_image(item_id, image_type, data, content_type):
         method="POST", body=base64.b64encode(data), content_type=content_type
     )
     if status not in (200, 204):
+        return False, "{} {}".format(status, raw[:200].decode("utf8", "replace"))
+    return True, ""
+
+
+# ----------------------------------------------------------------------
+# Dispatcharr API
+#
+# Dispatcharr is the upstream: its M3U is what Emby imports, so a logo fixed
+# here survives into Emby on the next refresh instead of being overwritten by
+# one. Two things about its data model drive the code below.
+#
+# A logo is a row with a unique URL, not a blob on the channel. Channels point
+# at one by id, so the URL doubles as a drift tag the way Emby's ImageTags do,
+# and nothing has to be downloaded to notice a provider swapping artwork.
+#
+# An auto created channel keeps provider metadata in its own columns and user
+# edits in a separate override row. An M3U sync rewrites the columns and never
+# the override, so writing the logo as an override is what makes it stick.
+# Manual channels have no override and sync never touches them, so there the
+# plain field is already durable.
+# ----------------------------------------------------------------------
+
+def dis_enabled():
+    return bool(STATE["dis_base"] and (STATE["dis_key"] or STATE["dis_user"]))
+
+
+def dis_login():
+    """Trade a username and password for a bearer token."""
+    body = json.dumps({"username": STATE["dis_user"],
+                       "password": STATE["dis_pass"]}).encode("utf8")
+    status, raw, _ = dis_raw("/api/accounts/token/", method="POST", body=body,
+                             content_type="application/json", authed=False)
+    if status != 200:
+        raise RuntimeError("Dispatcharr rejected those credentials ({})".format(status))
+    STATE["dis_token"] = json.loads(raw.decode("utf8")).get("access")
+    if not STATE["dis_token"]:
+        raise RuntimeError("Dispatcharr returned no access token")
+    return STATE["dis_token"]
+
+
+def dis_raw(path, method="GET", params=None, body=None, content_type=None,
+            timeout=60, authed=True):
+    url = "{}{}".format(STATE["dis_base"], path)
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    if content_type:
+        req.add_header("Content-Type", content_type)
+    if authed:
+        if STATE["dis_key"]:
+            req.add_header("X-API-Key", STATE["dis_key"])
+        elif STATE["dis_token"]:
+            req.add_header("Authorization", "Bearer " + STATE["dis_token"])
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers or {})
+    except urllib.error.URLError as e:
+        raise RuntimeError("Cannot reach Dispatcharr at {}: {}".format(
+            STATE["dis_base"], e.reason))
+
+
+def dis_call(path, method="GET", params=None, body=None, content_type=None,
+             timeout=60):
+    """As dis_raw, but logs in first and once more if a token has expired."""
+    if not STATE["dis_key"] and not STATE["dis_token"]:
+        dis_login()
+    status, raw, headers = dis_raw(path, method, params, body, content_type, timeout)
+    if status == 401 and not STATE["dis_key"]:
+        dis_login()
+        status, raw, headers = dis_raw(path, method, params, body, content_type, timeout)
+    return status, raw, headers
+
+
+def dis_json(path, params=None):
+    status, raw, _ = dis_call(path, params=params)
+    if status != 200:
+        raise RuntimeError("Dispatcharr returned {} for {}: {}".format(
+            status, path, raw[:300].decode("utf8", "replace")))
+    data = json.loads(raw.decode("utf8"))
+    # Its list endpoints drop the pagination envelope when no page is asked for.
+    return data.get("results", []) if isinstance(data, dict) else data
+
+
+def fetch_dis_channels():
+    return dis_json("/api/channels/channels/")
+
+
+def fetch_dis_logos():
+    return {lg["id"]: lg for lg in dis_json("/api/channels/logos/",
+                                            {"no_pagination": "true"})}
+
+
+def dis_logo_id(ch):
+    """The logo the M3U will actually emit: the override's, else the channel's."""
+    eff = ch.get("effective_logo_id")
+    return eff if eff is not None else ch.get("logo_id")
+
+
+def fetch_dis_image(logo_id):
+    status, raw, headers = dis_call(
+        "/api/channels/logos/{}/cache".format(logo_id), timeout=40)
+    if status != 200 or not raw:
+        return None, None
+    ctype = (headers.get("Content-Type") or "image/png").split(";")[0].strip()
+    return raw, ctype
+
+
+def dis_multipart(fields, data, filename, content_type):
+    """Build a multipart body. Dispatcharr's upload takes a file, not base64."""
+    boundary = "----logovault{}".format(hashlib.sha256(
+        filename.encode("utf8") + str(time.time()).encode()).hexdigest()[:24])
+    out = []
+    for name, value in fields.items():
+        out.append(b"--" + boundary.encode())
+        out.append('Content-Disposition: form-data; name="{}"'.format(name).encode())
+        out.append(b"")
+        out.append(str(value).encode("utf8"))
+    out.append(b"--" + boundary.encode())
+    out.append('Content-Disposition: form-data; name="file"; filename="{}"'
+               .format(filename).encode("utf8"))
+    out.append("Content-Type: {}".format(content_type).encode())
+    out.append(b"")
+    out.append(data)
+    out.append(b"--" + boundary.encode() + b"--")
+    out.append(b"")
+    return b"\r\n".join(out), "multipart/form-data; boundary=" + boundary
+
+
+def dis_upload_logo(name, data, content_type):
+    """Upload artwork and return the id of the logo row holding it.
+
+    Overwrites by filename, so pushing the same channel twice replaces the
+    file rather than piling up near duplicates in the logo manager.
+    """
+    if content_type not in DIS_MIME:
+        return None, "Dispatcharr will not take {}".format(content_type)
+    if len(data) > DIS_MAX_BYTES:
+        return None, "{} KB is over Dispatcharr's 5 MB limit".format(len(data) // 1024)
+    filename = "logovault_{}{}".format(name, MIME_EXT.get(content_type, ".png"))
+    body, ctype = dis_multipart(
+        {"name": name, "overwrite": "true"}, data, filename, content_type)
+    status, raw, _ = dis_call("/api/channels/logos/upload/", method="POST",
+                              body=body, content_type=ctype, timeout=90)
+    if status not in (200, 201):
+        return None, "upload returned {} {}".format(
+            status, raw[:200].decode("utf8", "replace"))
+    try:
+        return json.loads(raw.decode("utf8"))["id"], ""
+    except (ValueError, KeyError):
+        return None, "upload returned no logo id"
+
+
+def dis_assign_logo(ch, logo_id):
+    """Point a channel at a logo, where the next M3U sync cannot undo it."""
+    if ch.get("auto_created"):
+        payload = {"override": {"logo_id": logo_id}}
+    else:
+        payload = {"logo_id": logo_id}
+    status, raw, _ = dis_call(
+        "/api/channels/channels/{}/".format(ch["id"]), method="PATCH",
+        body=json.dumps(payload).encode("utf8"),
+        content_type="application/json")
+    if status not in (200, 202, 204):
         return False, "{} {}".format(status, raw[:200].decode("utf8", "replace"))
     return True, ""
 
@@ -283,11 +476,76 @@ def vault_read_image(rec):
 # State assembly
 # ----------------------------------------------------------------------
 
+def slot_record(rec, live_tag, live_bytes=None, orphan=False):
+    """One cell: what the server holds, what the vault holds, and the verdict.
+
+    live_bytes is a callable, so a byte comparison only happens when neither
+    side offers a tag to compare instead.
+    """
+    if live_tag and rec:
+        rtag = rec.get("tag")
+        if rtag and rtag != "probed" and live_tag != "probed":
+            status = "match" if rtag == live_tag else "differs"
+        else:
+            data = live_bytes() if live_bytes else None
+            status = ("match" if data and sha256(data) == rec.get("sha256")
+                      else "differs")
+    elif live_tag and not rec:
+        status = "unsaved"
+    elif rec and not live_tag:
+        status = "orphan" if orphan else "gone"
+    else:
+        status = "empty"
+    return {
+        "status": status,
+        "live": bool(live_tag),
+        "live_tag": live_tag,
+        "vault": bool(rec),
+        "vault_sha": (rec or {}).get("sha256"),
+        "origin": (rec or {}).get("origin"),
+        "source": (rec or {}).get("source"),
+        "saved": (rec or {}).get("saved"),
+    }
+
+
+def dis_slot(ch, rec):
+    """The Dispatcharr cell. A logo's URL is unique, so it serves as the tag."""
+    if not ch:
+        return slot_record(rec, None, orphan=True)
+    logo = ch.get("_logo") or {}
+    lid = logo.get("id")
+    slot = slot_record(
+        rec, logo.get("url"),
+        live_bytes=(lambda: fetch_dis_image(lid)[0]) if lid else None)
+    slot["live_id"] = lid
+    # An auto created channel takes the logo as an override, which survives an
+    # M3U sync. A manual one has no override and sync never touches it.
+    slot["override"] = bool(ch.get("auto_created"))
+    return slot
+
+
 def build_state(deep=False):
-    """Join live Emby channels against the vault. Uses image tags for speed."""
+    """Join live Emby and Dispatcharr channels against the vault.
+
+    Compares tags rather than bytes wherever either side offers one, which is
+    what keeps this quick on a guide with a few thousand channels.
+    """
     channels = fetch_channels()
     if deep:
         deep_probe(channels)
+
+    # Dispatcharr is optional. A reachability problem there must not take the
+    # Emby side of the page down with it.
+    dis_by_key, dis_error = {}, None
+    if dis_enabled():
+        try:
+            logos = fetch_dis_logos()
+            for ch in fetch_dis_channels():
+                ch["_logo"] = logos.get(dis_logo_id(ch)) or {}
+                dis_by_key[norm(ch.get("effective_name") or ch.get("name"))] = ch
+        except RuntimeError as e:
+            dis_error = str(e)
+
     m = read_manifest()
     rules = read_rules()
     group_counts = {}
@@ -299,39 +557,16 @@ def build_state(deep=False):
     for ch in channels:
         key = norm(ch.get("Name"))
         seen.add(key)
-        vc = vault_channels.get(key, {})
-        vimages = vc.get("images", {})
+        vimages = (vault_channels.get(key, {})).get("images", {})
         live_tags = ch.get("ImageTags") or {}
+        dch = dis_by_key.get(key)
 
         slots = {}
         for t in IMAGE_TYPES:
-            live_tag = live_tags.get(t)
-            rec = vimages.get(t)
-            if live_tag and rec:
-                rtag = rec.get("tag")
-                if rtag and rtag != "probed" and live_tag != "probed":
-                    status = "match" if rtag == live_tag else "differs"
-                else:
-                    # No usable tag on either side, so compare the bytes.
-                    live_data, _ = fetch_image(ch["Id"], t)
-                    status = ("match" if live_data and sha256(live_data) == rec.get("sha256")
-                              else "differs")
-            elif live_tag and not rec:
-                status = "unsaved"
-            elif rec and not live_tag:
-                status = "gone"
-            else:
-                status = "empty"
-            slots[t] = {
-                "status": status,
-                "live": bool(live_tag),
-                "live_tag": live_tag,
-                "vault": bool(rec),
-                "vault_sha": (rec or {}).get("sha256"),
-                "origin": (rec or {}).get("origin"),
-                "source": (rec or {}).get("source"),
-                "saved": (rec or {}).get("saved"),
-            }
+            slots[t] = slot_record(
+                vimages.get(t), live_tags.get(t),
+                live_bytes=lambda t=t, c=ch: fetch_image(c["Id"], t)[0])
+        slots[DISPATCHARR] = dis_slot(dch, vimages.get(DISPATCHARR))
 
         groups = channel_groups(ch)
         for g in (groups or ["Ungrouped"]):
@@ -343,8 +578,31 @@ def build_state(deep=False):
             "number": ch.get("ChannelNumber") or "",
             "id": ch.get("Id"),
             "in_emby": True,
+            "dis_id": (dch or {}).get("id"),
             "groups": groups,
             "excluded": is_excluded(ch, rules),
+            "slots": slots,
+        })
+
+    # Channels Dispatcharr carries that Emby has not imported yet. Their logos
+    # are still worth saving and fixing, since Emby picks them up on refresh.
+    for key, dch in dis_by_key.items():
+        if key in seen:
+            continue
+        seen.add(key)
+        name = dch.get("effective_name") or dch.get("name") or key
+        vimages = (vault_channels.get(key, {})).get("images", {})
+        slots = {t: slot_record(vimages.get(t), None) for t in IMAGE_TYPES}
+        slots[DISPATCHARR] = dis_slot(dch, vimages.get(DISPATCHARR))
+        rows.append({
+            "key": key,
+            "name": name,
+            "number": dch.get("effective_channel_number") or dch.get("channel_number") or "",
+            "id": None,
+            "in_emby": False,
+            "dis_id": dch.get("id"),
+            "groups": [],
+            "excluded": is_excluded({"Name": name}, rules),
             "slots": slots,
         })
 
@@ -352,24 +610,16 @@ def build_state(deep=False):
     for key, vc in vault_channels.items():
         if key in seen:
             continue
-        slots = {}
-        for t in IMAGE_TYPES:
-            rec = (vc.get("images") or {}).get(t)
-            slots[t] = {
-                "status": "orphan" if rec else "empty",
-                "live": False, "live_tag": None,
-                "vault": bool(rec),
-                "vault_sha": (rec or {}).get("sha256"),
-                "origin": (rec or {}).get("origin"),
-                "source": (rec or {}).get("source"),
-                "saved": (rec or {}).get("saved"),
-            }
+        vimages = vc.get("images") or {}
+        slots = {t: slot_record(vimages.get(t), None, orphan=True)
+                 for t in VAULT_SLOTS}
         rows.append({
             "key": key,
             "name": vc.get("name") or key,
             "number": vc.get("number") or "",
             "id": vc.get("emby_id"),
             "in_emby": False,
+            "dis_id": None,
             "groups": [],
             "excluded": is_excluded({"Name": vc.get("name") or key}, rules),
             "slots": slots,
@@ -383,11 +633,16 @@ def build_state(deep=False):
         "groups": groups,
         "rules": rules,
         "excluded_count": sum(1 for r in rows if r["excluded"]),
-        "types": IMAGE_TYPES,
+        "types": VAULT_SLOTS if dis_enabled() else IMAGE_TYPES,
+        "emby_types": IMAGE_TYPES,
+        "dis_type": DISPATCHARR,
         "labels": TYPE_LABEL,
         "notes": TYPE_NOTE,
         "manifest": {"created": m.get("created"), "updated": m.get("updated")},
         "emby_url": STATE["base"],
+        "dispatcharr": dis_enabled(),
+        "dispatcharr_url": STATE["dis_base"],
+        "dispatcharr_error": dis_error,
         "vault": os.path.abspath(STATE["vault"]),
     }
 
@@ -421,12 +676,73 @@ def chan_sort(num):
         return (1, 1e9)
 
 
+def load_dis_channels():
+    """Dispatcharr channels keyed the same way as Emby's, logo row attached."""
+    if not dis_enabled():
+        return {}
+    logos = fetch_dis_logos()
+    out = {}
+    for c in fetch_dis_channels():
+        c["_logo"] = logos.get(dis_logo_id(c)) or {}
+        out[norm(c.get("effective_name") or c.get("name"))] = c
+    return out
+
+
+def dis_name(ch):
+    return ch.get("effective_name") or ch.get("name") or ""
+
+
+def backup_one_emby(m, key, t, ch):
+    """True saved, False failed, None nothing there to save."""
+    if not ch:
+        return False
+    tag = (ch.get("ImageTags") or {}).get(t)
+    if not tag:
+        return None
+    data, ctype = fetch_image(ch["Id"], t)
+    if not data:
+        return False
+    entry = m["channels"].setdefault(key, {"images": {}})
+    entry["name"] = ch.get("Name")
+    entry["emby_id"] = ch.get("Id")
+    entry["number"] = ch.get("ChannelNumber")
+    entry.setdefault("images", {})[t] = vault_write_image(
+        safe_stem(ch.get("Name")) + "_" + key[:8], t, data, ctype,
+        tag=(None if tag == "probed" else tag), origin="emby")
+    return True
+
+
+def backup_one_dis(m, key, ch):
+    """The logo's URL goes in as the tag, which is how drift is spotted later."""
+    if not ch:
+        return False
+    logo = ch.get("_logo") or {}
+    if not logo.get("id"):
+        return None
+    data, ctype = fetch_dis_image(logo["id"])
+    if not data:
+        return False
+    entry = m["channels"].setdefault(key, {"images": {}})
+    entry.setdefault("name", dis_name(ch))
+    entry["dis_id"] = ch.get("id")
+    entry.setdefault("number", ch.get("effective_channel_number")
+                     or ch.get("channel_number"))
+    entry.setdefault("images", {})[DISPATCHARR] = vault_write_image(
+        safe_stem(dis_name(ch)) + "_" + key[:8], DISPATCHARR, data, ctype,
+        tag=logo.get("url"), origin="dispatcharr")
+    return True
+
+
 def do_backup(targets=None, deep=True):
-    """targets: list of (key, type) or None for everything currently in Emby."""
+    """Save artwork into the vault.
+
+    targets: list of (key, slot) or None for everything both servers hold.
+    """
     channels = fetch_channels()
     if deep:
         deep_probe(channels)
     by_key = {norm(c.get("Name")): c for c in channels}
+    dis_by_key = load_dis_channels()
     m = read_manifest()
 
     if targets is None:
@@ -439,31 +755,22 @@ def do_backup(targets=None, deep=True):
             for t in IMAGE_TYPES:
                 if tags.get(t):
                     targets.append((norm(c.get("Name")), t))
+        for key, c in dis_by_key.items():
+            if not is_excluded({"Name": dis_name(c)}, rules):
+                targets.append((key, DISPATCHARR))
 
     saved, failed = 0, 0
     for key, t in targets:
-        ch = by_key.get(key)
-        if not ch:
+        if t == DISPATCHARR:
+            ok = backup_one_dis(m, key, dis_by_key.get(key))
+        else:
+            ok = backup_one_emby(m, key, t, by_key.get(key))
+        if ok is None:
+            continue
+        if ok:
+            saved += 1
+        else:
             failed += 1
-            continue
-        tag = (ch.get("ImageTags") or {}).get(t)
-        if not tag:
-            continue
-        data, ctype = fetch_image(ch["Id"], t)
-        if not data:
-            failed += 1
-            continue
-        entry = m["channels"].setdefault(key, {
-            "name": ch.get("Name"), "emby_id": ch.get("Id"),
-            "number": ch.get("ChannelNumber"), "images": {},
-        })
-        entry["name"] = ch.get("Name")
-        entry["emby_id"] = ch.get("Id")
-        entry["number"] = ch.get("ChannelNumber")
-        entry["images"][t] = vault_write_image(
-            safe_stem(ch.get("Name")) + "_" + key[:8], t, data, ctype,
-            tag=(None if tag == "probed" else tag), origin="emby")
-        saved += 1
 
     write_manifest(m)
     return {"saved": saved, "failed": failed}
@@ -472,15 +779,18 @@ def do_backup(targets=None, deep=True):
 def do_copy_slot(keys, source="Primary", targets=None, overwrite=False):
     """Duplicate one slot's artwork into the other slots for each channel.
 
-    Prefers the vault copy of the source, falling back to whatever Emby holds.
-    Writes into the vault only, so nothing reaches Emby until you push.
+    Prefers the vault copy of the source, falling back to whatever the server
+    holding that slot has. Writes into the vault only, so nothing reaches Emby
+    or Dispatcharr until you push.
     """
-    if source not in IMAGE_TYPES:
+    slots = VAULT_SLOTS if dis_enabled() else IMAGE_TYPES
+    if source not in slots:
         source = "Primary"
-    targets = targets or [t for t in IMAGE_TYPES if t != source]
+    targets = targets or [t for t in slots if t != source]
     channels = fetch_channels()
     deep_probe(channels)
     by_key = {norm(c.get("Name")): c for c in channels}
+    dis_by_key = load_dis_channels() if source == DISPATCHARR else {}
     m = read_manifest()
 
     copied = skipped = no_source = 0
@@ -490,7 +800,11 @@ def do_copy_slot(keys, source="Primary", targets=None, overwrite=False):
         data = vault_read_image(rec) if rec else None
         ctype = rec["content_type"] if rec else None
 
-        if data is None:
+        if data is None and source == DISPATCHARR:
+            logo = (dis_by_key.get(key) or {}).get("_logo") or {}
+            if logo.get("id"):
+                data, ctype = fetch_dis_image(logo["id"])
+        elif data is None:
             ch = by_key.get(key)
             if ch:
                 data, ctype = fetch_image(ch["Id"], source)
@@ -579,6 +893,8 @@ def do_assign_from_library(key, image_type, sha, name=None, cid=None, number=Non
 
 
 def do_restore(targets, force=False):
+    """Push the vault back into Emby. Emby slots only; Dispatcharr is separate."""
+    targets = [(k, t) for k, t in targets if t in IMAGE_TYPES]
     channels = fetch_channels()
     by_key = {norm(c.get("Name")): c for c in channels}
     by_id = {c.get("Id"): c for c in channels}
@@ -616,6 +932,68 @@ def do_restore(targets, force=False):
             rec = (vc.get("images") or {}).get(t)
             if ch and rec:
                 newtag = (ch.get("ImageTags") or {}).get(t)
+                if newtag:
+                    rec["tag"] = newtag
+        write_manifest(m)
+    except RuntimeError:
+        pass
+
+    return results
+
+
+def do_push_dispatcharr(keys, force=False):
+    """Push the vault's Dispatcharr slot up into Dispatcharr.
+
+    Uploads the artwork as a logo, then points the channel at it. On an auto
+    created channel that write goes to the override row, which an M3U sync
+    leaves alone, so the logo holds instead of reverting on the next refresh.
+    Emby then inherits it whenever it refreshes its guide.
+    """
+    if not dis_enabled():
+        raise RuntimeError(
+            "Dispatcharr is not configured. Set DISPATCHARR_URL and either "
+            "DISPATCHARR_API_KEY or DISPATCHARR_USER and DISPATCHARR_PASS.")
+    dis_by_key = load_dis_channels()
+    m = read_manifest()
+
+    results = []
+    for key in keys:
+        rec = ((m["channels"].get(key) or {}).get("images") or {}).get(DISPATCHARR)
+        ch = dis_by_key.get(key)
+        ok, msg = False, ""
+
+        if not rec:
+            msg = "not in vault"
+        elif not ch:
+            msg = "no matching channel in Dispatcharr"
+        else:
+            data = vault_read_image(rec)
+            if data is None:
+                msg = "vault file missing"
+            elif not force and (ch.get("_logo") or {}).get("url") == rec.get("tag"):
+                ok, msg = True, "already matching, skipped"
+            else:
+                logo_id, err = dis_upload_logo(
+                    safe_stem(dis_name(ch)) + "_" + key[:8], data,
+                    rec["content_type"])
+                if not logo_id:
+                    msg = err
+                else:
+                    ok, err = dis_assign_logo(ch, logo_id)
+                    msg = err or (
+                        "pushed as an override, so an M3U refresh cannot undo it"
+                        if ch.get("auto_created") else "pushed")
+
+        results.append({"key": key, "type": DISPATCHARR, "ok": ok, "msg": msg})
+
+    # Refresh the stored tags so the grid shows green straight after a push.
+    try:
+        fresh = load_dis_channels()
+        for key in keys:
+            ch = fresh.get(key)
+            rec = ((m["channels"].get(key) or {}).get("images") or {}).get(DISPATCHARR)
+            if ch and rec:
+                newtag = (ch.get("_logo") or {}).get("url")
                 if newtag:
                     rec["tag"] = newtag
         write_manifest(m)
@@ -671,6 +1049,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, b"", "text/plain")
                 return self._send(200, data, ctype,
                                   {"Cache-Control": "no-cache"})
+            if path.startswith("/img/dis/"):
+                # Proxied rather than linked directly, so the browser needs no
+                # route to Dispatcharr of its own.
+                data, ctype = fetch_dis_image(path.rsplit("/", 1)[-1])
+                if not data:
+                    return self._send(404, b"", "text/plain")
+                return self._send(200, data, ctype,
+                                  {"Cache-Control": "no-cache"})
             if path == "/api/rules":
                 return self._json(read_rules())
             if path == "/api/library":
@@ -718,6 +1104,12 @@ class Handler(BaseHTTPRequestHandler):
                 targets = [(i["key"], i["type"]) for i in body.get("items", [])]
                 with LOCK:
                     return self._json({"results": do_restore(targets, body.get("force", False))})
+            if path == "/api/push_dispatcharr":
+                keys = [i["key"] for i in body.get("items", [])
+                        if i.get("type") == DISPATCHARR]
+                with LOCK:
+                    return self._json({"results": do_push_dispatcharr(
+                        keys, body.get("force", False))})
             if path in ("/api/copy_slot", "/api/copy_primary"):
                 with LOCK:
                     return self._json(do_copy_slot(
@@ -845,12 +1237,14 @@ input[type=search]{background:var(--surround);border:1px solid var(--edge);
 .chan .meta{min-width:0;flex:1}
 .rowbox{margin-top:5px;width:15px;height:15px;flex:none;accent-color:var(--focus)}
 #grid{padding:8px 20px 120px}
-.head{display:grid;grid-template-columns:220px repeat(3,1fr);gap:14px;
+/* Column count follows the slots the server reports, so the Dispatcharr
+   column appears only when Dispatcharr is configured. */
+.head{display:grid;grid-template-columns:220px repeat(var(--cols,3),1fr);gap:14px;
   padding:14px 0 8px;position:sticky;top:57px;background:var(--surround);z-index:10}
 .head div{font-size:13px;font-weight:500}
 .head span{display:block;font-size:11.5px;color:var(--ink-dim);font-weight:400}
 
-.row{display:grid;grid-template-columns:220px repeat(3,1fr);gap:14px;
+.row{display:grid;grid-template-columns:220px repeat(var(--cols,3),1fr);gap:14px;
   padding:10px 0;border-top:1px solid #565a60;align-items:start}
 .chan{padding-top:4px;min-width:0}
 .num{font-size:12px;color:var(--ink-dim)}
@@ -982,9 +1376,7 @@ footer{position:fixed;bottom:0;left:0;right:0;background:var(--panel);
 <div id="selbar">
   <span class="lbl">Select</span>
   <button data-sel="all">Every cell</button>
-  <button data-sel="Primary">All primary</button>
-  <button data-sel="LogoLight">All logo light</button>
-  <button data-sel="LogoLightColor">All logo light color</button>
+  <span id="selslots"></span>
   <button data-sel="none">Clear</button>
   <span class="scope" id="scope"></span>
 </div>
@@ -993,6 +1385,7 @@ footer{position:fixed;bottom:0;left:0;right:0;background:var(--panel);
 
 <footer>
   <button class="btn go" id="push" disabled>Push selected to Emby</button>
+  <button class="btn go" id="pushdis" disabled hidden>Push selected to Dispatcharr</button>
   <button class="btn" id="save" disabled>Save selected to vault</button>
   <button class="btn" id="clear" disabled>Clear selection</button>
   <div id="log">Select any cell to stage it. Drop an image file on a cell to replace the stored artwork.</div>
@@ -1002,7 +1395,10 @@ footer{position:fixed;bottom:0;left:0;right:0;background:var(--panel);
 <div id="veil" hidden></div>
 
 <script>
-const TYPES=["Primary","LogoLight","LogoLightColor"];
+// Slots come from the server: the three Emby ones, plus Dispatcharr when it
+// is configured. Emby and Dispatcharr are pushed separately.
+let TYPES=["Primary","LogoLight","LogoLightColor"];
+let EMBY_TYPES=TYPES, DIS_TYPE="Dispatcharr";
 let DATA=null, SEL=new Set(), SHOW="all", Q="", pickTarget=null;
 
 function say(t){
@@ -1033,17 +1429,7 @@ function bulkSelect(type){
 }
 
 // How many of the selection each action can actually act on.
-function actionable(kind){
-  let n=0;
-  for(const id of SEL){
-    const i=id.lastIndexOf("|");
-    const ch=BYKEY[id.slice(0,i)];
-    if(!ch) continue;
-    const s=ch.slots[id.slice(i+1)];
-    if(s && (kind==="push"?s.vault:s.live)) n++;
-  }
-  return n;
-}
+const actionable=kind=>staged(kind).length;
 
 async function jget(u){const r=await fetch(u);const j=await r.json();
   if(j.error)throw new Error(j.error);return j;}
@@ -1053,7 +1439,18 @@ async function jpost(u,b){const r=await fetch(u,{method:"POST",
 
 let DEEP=false;
 async function load(){
-  try{ DATA=await jget("/api/state"+(DEEP?"?deep=1":"")); render(); }
+  try{
+    DATA=await jget("/api/state"+(DEEP?"?deep=1":""));
+    TYPES=DATA.types; EMBY_TYPES=DATA.emby_types; DIS_TYPE=DATA.dis_type;
+    document.documentElement.style.setProperty("--cols",TYPES.length);
+    document.getElementById("pushdis").hidden=!DATA.dispatcharr;
+    document.getElementById("selslots").innerHTML=TYPES.map(t=>
+      '<button data-sel="'+t+'">All '+esc(DATA.labels[t].toLowerCase())+'</button>').join("");
+    wireSelbar();
+    render();
+    // Dispatcharr being unreachable must not take the Emby side down with it.
+    if(DATA.dispatcharr_error) say("Dispatcharr: "+DATA.dispatcharr_error);
+  }
   catch(e){ document.getElementById("grid").innerHTML=
     '<div class="empty">Could not read from Emby.<br>'+e.message+'</div>'; }
 }
@@ -1072,24 +1469,29 @@ function visible(ch){
   });
 }
 
-const WORD={match:"Matches vault",differs:"Changed in Emby",unsaved:"Not in vault",
-  gone:"Missing from Emby",orphan:"Vault only",empty:"No artwork"};
+const WORD={match:"Matches vault",differs:"Changed upstream",unsaved:"Not in vault",
+  gone:"Missing from server",orphan:"Vault only",empty:"No artwork"};
+const SERVER=t=>t===DIS_TYPE?"Dispatcharr":"Emby";
 
 function tile(ch,t,which){
   const s=ch.slots[t], bust="?v="+Date.now();
   if(which==="live"){
-    if(!s.live)return '<div class="tile void"><em>none in Emby</em></div>';
-    return '<div class="tile"><img loading="lazy" alt="'+esc(ch.name)+' '+t+' in Emby" src="/img/live/'+ch.id+'/'+t+'?t='+encodeURIComponent(s.live_tag||"")+'"><span class="tag">Emby</span></div>';
+    if(!s.live)return '<div class="tile void"><em>none in '+SERVER(t)+'</em></div>';
+    const src = t===DIS_TYPE ? "/img/dis/"+s.live_id
+                             : "/img/live/"+ch.id+"/"+t+"?t="+encodeURIComponent(s.live_tag||"");
+    return '<div class="tile"><img loading="lazy" alt="'+esc(ch.name)+' '+t+' in '+SERVER(t)+'" src="'+src+'"><span class="tag">'+SERVER(t)+'</span></div>';
   }
   if(!s.vault)return '<div class="tile void"><em>none in vault</em></div>';
   return '<div class="tile"><img loading="lazy" alt="'+esc(ch.name)+' '+t+' in vault" src="/img/vault/'+ch.key+'/'+t+bust+'"><span class="tag">'+esc(ORIGIN(s.origin,s.source))+'</span></div>';
 }
 
-const SHORT={Primary:"Primary",LogoLight:"Light",LogoLightColor:"Light color"};
+const SHORT={Primary:"Primary",LogoLight:"Light",LogoLightColor:"Light color",
+  Dispatcharr:"Dispatcharr"};
 function ORIGIN(o,src){
   if(o==="custom")return "Custom";
   if(o==="copy")return "From "+(SHORT[src]||"another slot");
   if(o==="library")return "From "+(src||"vault");
+  if(o==="dispatcharr")return "Dispatcharr";
   return "Vault";
 }
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -1140,11 +1542,14 @@ function render(){
 }
 
 function syncButtons(){
-  const n=SEL.size, np=actionable("push"), ns=actionable("save");
+  const n=SEL.size, np=actionable("push"), nd=actionable("pushdis"),
+        ns=actionable("save");
   document.getElementById("push").disabled=!np;
+  document.getElementById("pushdis").disabled=!nd;
   document.getElementById("save").disabled=!ns;
   document.getElementById("clear").disabled=!n;
   document.getElementById("push").textContent = n?("Push "+np+" to Emby"):"Push selected to Emby";
+  document.getElementById("pushdis").textContent = n?("Push "+nd+" to Dispatcharr"):"Push selected to Dispatcharr";
   document.getElementById("save").textContent = n?("Save "+ns+" to vault"):"Save selected to vault";
   for(const b of document.querySelectorAll("#selbar button[data-sel]")){
     const k=b.dataset.sel;
@@ -1159,13 +1564,20 @@ function toggle(id){ SEL.has(id)?SEL.delete(id):SEL.add(id);
   if(el){el.classList.toggle("sel",SEL.has(id));el.setAttribute("aria-pressed",SEL.has(id));}
   syncButtons(); }
 
-for(const b of document.querySelectorAll("#selbar button[data-sel]")){
-  b.addEventListener("click",()=>{
-    const k=b.dataset.sel;
-    if(k==="none"){SEL.clear();render();say("Selection cleared.");return;}
-    bulkSelect(k==="all"?null:k);
-  });
+// Re-wired after each load, since the per slot buttons are built from the
+// slots the server reports.
+function wireSelbar(){
+  for(const b of document.querySelectorAll("#selbar button[data-sel]")){
+    if(b.dataset.wired) continue;
+    b.dataset.wired="1";
+    b.addEventListener("click",()=>{
+      const k=b.dataset.sel;
+      if(k==="none"){SEL.clear();render();say("Selection cleared.");return;}
+      bulkSelect(k==="all"?null:k);
+    });
+  }
 }
+wireSelbar();
 
 document.getElementById("grid").addEventListener("change",e=>{
   const box=e.target.closest(".rowbox"); if(!box)return;
@@ -1383,7 +1795,11 @@ function staged(kind){
     const i=id.lastIndexOf("|"), k=id.slice(0,i), t=id.slice(i+1);
     const ch=BYKEY[k]; if(!ch) continue;
     const s=ch.slots[t]; if(!s) continue;
-    if(kind==="push"?s.vault:s.live) out.push({key:k,type:t});
+    if(kind==="save"){ if(s.live) out.push({key:k,type:t}); continue; }
+    // The two destinations are pushed separately, so each push takes only
+    // the cells that belong to it.
+    if(!s.vault) continue;
+    if(kind==="pushdis" ? t===DIS_TYPE : t!==DIS_TYPE) out.push({key:k,type:t});
   }
   return out;
 }
@@ -1402,11 +1818,25 @@ document.getElementById("push").addEventListener("click",async()=>{
   }catch(e){say("Push failed. "+e.message);}
 });
 
+document.getElementById("pushdis").addEventListener("click",async()=>{
+  const items=staged("pushdis");
+  if(!items.length){say("Select a Dispatcharr cell holding vault artwork first.");return;}
+  say("Pushing "+items.length+" to Dispatcharr...");
+  try{
+    const r=await jpost("/api/push_dispatcharr",{items,force:true});
+    const bad=r.results.filter(x=>!x.ok);
+    say("Pushed "+(r.results.length-bad.length)+" of "+r.results.length+" to Dispatcharr. "+
+        (bad.length?"Failed: "+bad.map(b=>b.key+" ("+b.msg+")").join(", ")
+                   :"Emby picks these up on its next guide refresh."));
+    SEL.clear(); load();
+  }catch(e){say("Push to Dispatcharr failed. "+e.message);}
+});
+
 document.getElementById("save").addEventListener("click",async()=>{
   const items=staged("save");
   const dropped=SEL.size-items.length;
-  if(!items.length){say("None of the selected cells have artwork in Emby to save.");return;}
-  say("Saving "+items.length+" to the vault"+(dropped?" ("+dropped+" skipped, nothing in Emby)":"")+"...");
+  if(!items.length){say("None of the selected cells have server artwork to save.");return;}
+  say("Saving "+items.length+" to the vault"+(dropped?" ("+dropped+" skipped, nothing on the server)":"")+"...");
   try{const r=await jpost("/api/backup",{items});
     say("Saved "+r.saved+", skipped "+r.failed+".");SEL.clear();load();}
   catch(e){say("Save failed. "+e.message);}
@@ -1417,8 +1847,8 @@ document.getElementById("clear").addEventListener("click",()=>{SEL.clear();rende
 document.getElementById("fill").addEventListener("click",async()=>{
   const rows=DATA.channels.filter(visible);
   const keys=rows.filter(c=>TYPES.some(t=>t!=="Primary"&&!c.slots[t].vault)).map(c=>c.key);
-  if(!keys.length){say("Every channel on screen already has artwork in both logo slots.");return;}
-  say("Copying Primary into empty logo slots for "+keys.length+" channels...");
+  if(!keys.length){say("Every channel on screen already has artwork in every other slot.");return;}
+  say("Copying Primary into empty slots for "+keys.length+" channels...");
   try{
     const r=await jpost("/api/copy_slot",{keys,source:"Primary",overwrite:false});
     say("Filled "+r.copied+" empty slots. "+r.no_source+" channels had no Primary to copy. "+
@@ -1435,7 +1865,8 @@ document.getElementById("deep").addEventListener("click",async()=>{
 });
 
 document.getElementById("backupAll").addEventListener("click",async()=>{
-  say("Reading every logo out of Emby. This takes a moment on a large guide...");
+  say("Reading every logo out of "+(DATA.dispatcharr?"Emby and Dispatcharr":"Emby")+
+      ". This takes a moment on a large guide...");
   try{const r=await jpost("/api/backup",{});say("Vault now holds "+r.saved+" images. "+r.failed+" could not be read.");load();}
   catch(e){say("Backup failed. "+e.message);}
 });
@@ -1473,6 +1904,21 @@ def configure(args):
     STATE["vault"] = args.vault
     if not STATE["base"] or not STATE["key"]:
         raise SystemExit("Set EMBY_URL and EMBY_API_KEY, or pass --url and --key.")
+
+    # Dispatcharr is optional. Without it the tool behaves exactly as before.
+    STATE["dis_base"] = (getattr(args, "dispatcharr_url", None)
+                         or os.environ.get("DISPATCHARR_URL") or "").rstrip("/")
+    STATE["dis_key"] = (getattr(args, "dispatcharr_key", None)
+                        or os.environ.get("DISPATCHARR_API_KEY"))
+    STATE["dis_user"] = (getattr(args, "dispatcharr_user", None)
+                         or os.environ.get("DISPATCHARR_USER"))
+    STATE["dis_pass"] = (getattr(args, "dispatcharr_pass", None)
+                         or os.environ.get("DISPATCHARR_PASS"))
+    if STATE["dis_base"] and not (STATE["dis_key"] or STATE["dis_user"]):
+        raise SystemExit(
+            "DISPATCHARR_URL is set but no credentials are. Set "
+            "DISPATCHARR_API_KEY, or DISPATCHARR_USER and DISPATCHARR_PASS.")
+
     os.makedirs(STATE["vault"], exist_ok=True)
 
 
@@ -1481,6 +1927,8 @@ def cmd_serve(args):
     url = "http://{}:{}".format(
         "localhost" if args.host in ("0.0.0.0", "") else args.host, args.port)
     print("Emby      {}".format(STATE["base"]))
+    if dis_enabled():
+        print("Dispatch  {}".format(STATE["dis_base"]))
     print("Vault     {}".format(os.path.abspath(STATE["vault"])))
     print("Interface {}".format(url))
     print("Ctrl+C to stop.")
@@ -1500,13 +1948,16 @@ def cmd_backup(args):
 
 def cmd_fill(args):
     st = build_state()
-    others = [t for t in IMAGE_TYPES if t != args.source]
+    others = [t for t in st["types"] if t != args.source]
     keys = [ch["key"] for ch in st["channels"] if not ch["excluded"]
             and (args.overwrite or any(not ch["slots"][t]["vault"] for t in others))]
     r = do_copy_slot(keys, source=args.source, overwrite=args.overwrite)
     print("Copied {} slots, skipped {} already filled, {} channels had no {}."
           .format(r["copied"], r["skipped"], r["no_source"], TYPE_LABEL[args.source]))
-    print("Nothing has reached Emby yet. Review, then run: restore --force")
+    print("Nothing has been pushed anywhere yet. Review, then run one of:")
+    print("  restore --force                    push to Emby")
+    if dis_enabled():
+        print("  restore --target dispatcharr       push to Dispatcharr")
 
 
 def cmd_groups(args):
@@ -1543,15 +1994,19 @@ def cmd_include(args):
 
 def cmd_status(args):
     st = build_state()
-    counts = {}
-    for ch in st["channels"]:
-        for t in IMAGE_TYPES:
-            s = ch["slots"][t]["status"]
-            counts[s] = counts.get(s, 0) + 1
+    slots = st["types"]
+    if st.get("dispatcharr_error"):
+        print("Dispatcharr unreachable: {}".format(st["dispatcharr_error"]))
     print("Vault updated: {}".format(st["manifest"]["updated"] or "never"))
+
+    print("\n{:<10}{}".format("", "".join(
+        "{:>14}".format(TYPE_SHORT[t]) for t in slots)))
     for k in ("match", "differs", "unsaved", "gone", "orphan", "empty"):
-        print("  {:<9} {}".format(k, counts.get(k, 0)))
-    drift = [(ch["name"], t) for ch in st["channels"] for t in IMAGE_TYPES
+        row = [sum(1 for ch in st["channels"] if ch["slots"][t]["status"] == k)
+               for t in slots]
+        print("{:<10}{}".format(k, "".join("{:>14}".format(n) for n in row)))
+
+    drift = [(ch["name"], t) for ch in st["channels"] for t in slots
              if ch["slots"][t]["status"] in ("differs", "gone")]
     if drift:
         print("\nChanged since backup:")
@@ -1559,19 +2014,33 @@ def cmd_status(args):
             print("  {:<38} {}".format(name[:38], TYPE_LABEL[t]))
 
 
-def cmd_restore(args):
-    st = build_state()
+def restore_targets(st, slots, force):
     targets, why = [], []
     for ch in st["channels"]:
         if ch["excluded"]:
             continue
-        for t in IMAGE_TYPES:
+        for t in slots:
             s = ch["slots"][t]
             if not s["vault"]:
                 continue
-            if args.force or s["status"] in ("differs", "gone"):
+            if force or s["status"] in ("differs", "gone"):
                 targets.append((ch["key"], t))
                 why.append((ch["name"], t, s["status"]))
+    return targets, why
+
+
+def cmd_restore(args):
+    """Push the vault out. Emby and Dispatcharr are separate destinations."""
+    to_emby = args.target in ("emby", "both")
+    to_dis = args.target in ("dispatcharr", "both")
+    if to_dis and not dis_enabled():
+        raise SystemExit(
+            "Dispatcharr is not configured. Set DISPATCHARR_URL and either "
+            "DISPATCHARR_API_KEY or DISPATCHARR_USER and DISPATCHARR_PASS.")
+
+    st = build_state()
+    slots = (IMAGE_TYPES if to_emby else []) + ([DISPATCHARR] if to_dis else [])
+    targets, why = restore_targets(st, slots, args.force)
 
     if args.preview:
         print("Would push {} images:".format(len(targets)))
@@ -1583,13 +2052,25 @@ def cmd_restore(args):
     if not targets:
         print("Nothing to restore.")
         return
+
+    results = []
+    if to_emby:
+        results += do_restore([(k, t) for k, t in targets if t != DISPATCHARR],
+                              force=args.force)
+    if to_dis:
+        results += do_push_dispatcharr(
+            [k for k, t in targets if t == DISPATCHARR], force=args.force)
+
     ok = 0
-    for r in do_restore(targets, force=args.force):
+    for r in results:
         if r["ok"]:
             ok += 1
         else:
             print("  failed  {} {}  ({})".format(r["key"], r["type"], r["msg"]))
-    print("Pushed {} of {}.".format(ok, len(targets)))
+    print("Pushed {} of {}.".format(ok, len(results)))
+    if to_dis and ok:
+        print("Dispatcharr logos are set as overrides where the channel was "
+              "auto created, so an M3U refresh will not undo them.")
 
 
 def main():
@@ -1597,6 +2078,10 @@ def main():
     p.add_argument("--url", help="Emby base URL (or EMBY_URL)")
     p.add_argument("--key", help="Emby API key (or EMBY_API_KEY)")
     p.add_argument("--vault", default=os.environ.get("EMBY_LOGO_VAULT", "./emby_logo_vault"))
+    p.add_argument("--dispatcharr-url", help="Dispatcharr base URL (or DISPATCHARR_URL)")
+    p.add_argument("--dispatcharr-key", help="Dispatcharr API key (or DISPATCHARR_API_KEY)")
+    p.add_argument("--dispatcharr-user", help="Dispatcharr username (or DISPATCHARR_USER)")
+    p.add_argument("--dispatcharr-pass", help="Dispatcharr password (or DISPATCHARR_PASS)")
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("serve", help="Run the web interface (default)")
@@ -1611,12 +2096,15 @@ def main():
     i = sub.add_parser("include", help="Start backing up one or more groups again")
     i.add_argument("group", nargs="+")
     f = sub.add_parser("fill", help="Copy one slot into the others in the vault")
-    f.add_argument("--source", default="Primary", choices=IMAGE_TYPES,
+    f.add_argument("--source", default="Primary", choices=VAULT_SLOTS,
                    help="Slot to copy from (default: Primary)")
     f.add_argument("--overwrite", action="store_true",
                    help="Also replace slots that already hold artwork")
     sub.add_parser("status", help="Report drift, change nothing")
-    r = sub.add_parser("restore", help="Push vault logos back into Emby")
+    r = sub.add_parser("restore", help="Push vault logos back to a server")
+    r.add_argument("--target", default="emby",
+                   choices=["emby", "dispatcharr", "both"],
+                   help="Where to push (default: emby)")
     r.add_argument("--preview", action="store_true")
     r.add_argument("--force", action="store_true")
 
